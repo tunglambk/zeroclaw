@@ -19569,10 +19569,37 @@ api_key = "anthropic-key"
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
     /// delivery flags (`suppress_voice`, `force_voice`) and not only on
-    /// recipient and text.
-    #[derive(Default)]
+    /// recipient and text. `telegram(drafts)` names it `telegram` and, when
+    /// asked, advertises draft support so a test can drive the streaming
+    /// finalization arm as well as the plain send.
     struct SendMessageRecordingChannel {
+        channel_name: &'static str,
+        drafts: bool,
         sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+        finalized: tokio::sync::Mutex<Vec<(String, String, String, bool)>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl Default for SendMessageRecordingChannel {
+        fn default() -> Self {
+            Self {
+                channel_name: "test-channel",
+                drafts: false,
+                sent_messages: tokio::sync::Mutex::new(Vec::new()),
+                finalized: tokio::sync::Mutex::new(Vec::new()),
+                cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SendMessageRecordingChannel {
+        fn telegram(drafts: bool) -> Self {
+            Self {
+                channel_name: "telegram",
+                drafts,
+                ..Self::default()
+            }
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for SendMessageRecordingChannel {
@@ -19589,11 +19616,43 @@ api_key = "anthropic-key"
     #[async_trait::async_trait]
     impl Channel for SendMessageRecordingChannel {
         fn name(&self) -> &str {
-            "test-channel"
+            self.channel_name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            self.drafts
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+            suppress_voice: bool,
+        ) -> anyhow::Result<()> {
+            self.finalized.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+                suppress_voice,
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}"));
             Ok(())
         }
 
@@ -33798,6 +33857,253 @@ BTC is currently around $65,000 based on latest tool output."#
             sender_prefers_voice(&ctx, &msg),
             Some(true),
             "a private chat's address is the peer's own id, so the numeric case stays compatible"
+        );
+    }
+
+    /// A Telegram group reply whose chat id differs from the sender's own id, so
+    /// a destination comparison cannot stand in for the sender identity.
+    fn telegram_group_message(
+        sender: &str,
+        platform_sender_id: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: sender.to_string(),
+            platform_sender_id: Some(platform_sender_id.to_string()),
+            reply_target: "-1001234567890".to_string(),
+            content: "hello".to_string(),
+            channel: "telegram".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Drives the real dispatch and reply-delivery path with a voice group that
+    /// names the numeric sender id.
+    fn telegram_voice_delivery_ctx(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "family".to_string(),
+            voice_peer_group("telegram.default", &["111"]),
+        );
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            zeroclaw_config::schema::Config {
+                peer_groups,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            tools,
+        )
+    }
+
+    fn delivered_reply<'a>(sent: &'a [SendMessage], recipient: &str) -> &'a SendMessage {
+        sent.iter()
+            .find(|message| message.recipient == recipient)
+            .unwrap_or_else(|| panic!("no reply delivered to {recipient}; got {sent:?}"))
+    }
+
+    #[tokio::test]
+    async fn telegram_voice_peer_is_force_voiced_on_ordinary_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.force_voice,
+            "the configured sender's reply must be voiced, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a voice peer's reply must not be suppressed, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_voice_peer_is_force_voiced_on_streaming_final_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(true));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a forced voice reply must replace the draft placeholder rather than finalize it"
+        );
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.force_voice,
+            "the streaming final delivery must carry force_voice, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_non_member_reply_stays_text_on_ordinary_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@bob", "222"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            !reply.force_voice,
+            "a non-member must not borrow another member's voice preference, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a non-member's reply is ordinary text, not an explicit suppression, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_non_member_reply_stays_text_on_streaming_final_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(true));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@bob", "222"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let finalized = channel_impl.finalized.lock().await;
+        let entry = finalized
+            .iter()
+            .find(|(recipient, _, _, _)| recipient == "-1001234567890")
+            .unwrap_or_else(|| panic!("no draft finalization; got {finalized:?}"));
+        assert!(
+            !entry.3,
+            "a non-member's streaming finalization must stay text, got {entry:?}"
+        );
+    }
+
+    struct SendViaTextRoutingProvider;
+
+    fn send_via_text_tool_call() -> String {
+        "<tool_call>\n{\"name\":\"send_via\",\"arguments\":{\"modality\":\"text\"}}\n</tool_call>"
+            .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SendViaTextRoutingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(send_via_text_tool_call())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            {
+                Ok("the reply".to_string())
+            } else {
+                Ok(send_via_text_tool_call())
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SendViaTextRoutingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SendViaTextRoutingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_explicit_text_override_stays_text_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let send_via = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            Arc::new(parking_lot::RwLock::new(
+                HashMap::<String, Arc<dyn Channel>>::new(),
+            )),
+            Arc::new(HashMap::<String, zeroclaw_config::multi_agent::PeerGroupConfig>::new),
+        );
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(SendViaTextRoutingProvider),
+            vec![Box::new(send_via)],
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.suppress_voice,
+            "the explicit text override must win over the sender's voice preference, got {reply:?}"
+        );
+        assert!(
+            !reply.force_voice,
+            "the explicit text override must not force voice, got {reply:?}"
         );
     }
 
