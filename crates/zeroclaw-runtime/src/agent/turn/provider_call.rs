@@ -525,8 +525,15 @@ mod payload_capture_tests {
         }
     }
 
-    fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
-        test_ctx_with_delta(observer, pacing, None, StreamReasoningMode::Status)
+    // `turn_id` becomes the `trace_id` on the emitted `llm_request` record. The
+    // capture subscriber is process-wide, so callers must pass a trace id that
+    // no other test in this binary emits.
+    fn test_ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        turn_id: &'a str,
+    ) -> TurnCtx<'a> {
+        test_ctx_with_delta(observer, pacing, None, StreamReasoningMode::Status, turn_id)
     }
 
     fn test_ctx_with_delta<'a>(
@@ -534,6 +541,7 @@ mod payload_capture_tests {
         pacing: &'a PacingConfig,
         on_delta: Option<&'a tokio::sync::mpsc::Sender<StreamDelta>>,
         draft_reasoning: StreamReasoningMode,
+        turn_id: &'a str,
     ) -> TurnCtx<'a> {
         TurnCtx {
             parent_agent_alias: None,
@@ -560,7 +568,7 @@ mod payload_capture_tests {
             channel: None,
             draft_reasoning,
             agent_alias: None,
-            turn_id: "trace-req-test",
+            turn_id,
             serving_provider_name: None,
             serving_model: None,
         }
@@ -575,7 +583,7 @@ mod payload_capture_tests {
 
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
-            let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
+            let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode, "trace-status-mode");
             let _ = announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0)
                 .await;
             drop(tx);
@@ -590,7 +598,13 @@ mod payload_capture_tests {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
-        let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
+        let ctx = test_ctx_with_delta(
+            &observer,
+            &pacing,
+            Some(&tx),
+            StreamReasoningMode::Status,
+            "trace-status-mode",
+        );
         let _ =
             announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 3).await;
         drop(tx);
@@ -606,6 +620,7 @@ mod payload_capture_tests {
 
     async fn next_llm_request(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        trace_id: &str,
     ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -617,7 +632,7 @@ mod payload_capture_tests {
                         .get("attributes")
                         .and_then(|a| a.get("trace_id"))
                         .and_then(|v| v.as_str())
-                        == Some("trace-req-test");
+                        == Some(trace_id);
                     if ours && value.get("message").and_then(|v| v.as_str()) == Some("llm_request")
                     {
                         return value;
@@ -671,10 +686,10 @@ mod payload_capture_tests {
         install_writer("redacted");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = test_ctx(&observer, &pacing, "trace-payload-redacts");
         let _ =
             announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
-        let on_record = next_llm_request(&mut rx).await;
+        let on_record = next_llm_request(&mut rx, "trace-payload-redacts").await;
 
         let attrs = on_record
             .get("attributes")
@@ -711,10 +726,10 @@ mod payload_capture_tests {
         install_writer("off");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = test_ctx(&observer, &pacing, "trace-payload-redacts");
         let _ =
             announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
-        let off_record = next_llm_request(&mut rx).await;
+        let off_record = next_llm_request(&mut rx, "trace-payload-redacts").await;
 
         let off_attrs = off_record
             .get("attributes")
@@ -916,7 +931,7 @@ mod payload_capture_tests {
         let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
         let expected = prefix_fingerprint(&history, Some(&tools));
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = test_ctx(&observer, &pacing, "trace-payload-off");
         let _ = announce_llm_request(
             &ctx,
             &history,
@@ -927,7 +942,7 @@ mod payload_capture_tests {
             0,
         )
         .await;
-        let record = next_llm_request(&mut rx).await;
+        let record = next_llm_request(&mut rx, "trace-payload-off").await;
 
         let attrs = record
             .get("attributes")
