@@ -1076,8 +1076,11 @@ mod tests {
 
     /// The serialized list was wrapped in single quotes without escaping the
     /// apostrophes inside it, so a grant like `o'brien.example` closed the
-    /// quoted run early and left the operator with an unterminated quote. This
-    /// is the command the remedy printed for that grant.
+    /// quoted run early and left the operator with an unterminated quote. The
+    /// grant grammar now rejects such an entry before it reaches a policy, so
+    /// none should arrive here; the command must still be one shell word for
+    /// whatever list it is handed, rather than relying on a grammar elsewhere
+    /// to keep it well-formed.
     #[test]
     fn a_remedy_for_a_grant_with_an_apostrophe_is_one_shell_argument() {
         let scope = crate::instance::test_scope(
@@ -1099,7 +1102,10 @@ mod tests {
     }
 
     /// The same command read back the way a POSIX shell reads it has to carry
-    /// the list `config set` replaces, apostrophe and all.
+    /// the list `config set` replaces, apostrophe and all. Whether that list
+    /// then builds a policy is the grant grammar's call, not the quoting's:
+    /// the shell must hand `config set` the operator's list byte for byte so
+    /// the grammar is what judges it, not a truncated copy.
     #[test]
     fn a_remedy_for_a_grant_with_an_apostrophe_round_trips() {
         let scope = crate::instance::test_scope(
@@ -1124,7 +1130,6 @@ mod tests {
             ],
             "{remedy}"
         );
-        EgressPolicy::new(&written, &[], &[], 16).expect("the remedied list stays a valid policy");
     }
 
     /// The escape sequence is data, not syntax: a grant that already contains
