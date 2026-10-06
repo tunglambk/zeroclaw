@@ -317,6 +317,11 @@ pub struct CostSummary {
     pub total_tokens: u64,
     /// Number of requests
     pub request_count: usize,
+    /// Ledger lines the summary scan could not read as complete cost
+    /// records. Non-zero means the totals above are incomplete and exclude
+    /// whatever those lines held; the raw lines stay in the ledger.
+    #[serde(default)]
+    pub rejected_records: usize,
     /// Breakdown by model
     pub by_model: std::collections::HashMap<String, ModelStats>,
     /// Breakdown by agent alias. Empty when `[cost].track_per_agent =
@@ -385,6 +390,7 @@ impl Default for CostSummary {
             monthly_cost_usd: 0.0,
             total_tokens: 0,
             request_count: 0,
+            rejected_records: 0,
             by_model: std::collections::HashMap::new(),
             by_agent: std::collections::HashMap::new(),
         }
