@@ -318,7 +318,10 @@ pub struct CostSummary {
     /// Number of requests
     pub request_count: usize,
     /// Ledger lines the summary scan could not read as complete cost
-    /// records. Non-zero means the totals above are incomplete and exclude
+    /// records. This is a ledger-wide integrity count, not a count scoped
+    /// to the summary's window, agent, or task: a torn line has no
+    /// readable timestamp, so it can't be attributed to a scope. Non-zero
+    /// means the ledger is damaged and the totals above may exclude
     /// whatever those lines held; the raw lines stay in the ledger.
     #[serde(default)]
     pub rejected_records: usize,
