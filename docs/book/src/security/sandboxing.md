@@ -26,16 +26,23 @@ for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
-`sandbox_backend = "auto"` picks the best available backend at startup:
+`sandbox_backend = "auto"` resolves a backend when the sandbox is created. The order depends on the platform, on the sandbox features the binary was compiled with, and on the runtime kind:
 
-| Platform | Preferred order |
+| Platform | Order tried |
 |---|---|
-| Linux | Landlock (kernel 5.13+) → Bubblewrap → Firejail → Docker → none |
-| macOS | Seatbelt (`sandbox-exec`, native) → Docker → none |
-| Windows | AppContainer (experimental) → Docker → none |
-| Any | Docker (if daemon reachable) → none |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
+| Windows | No OS-level backend |
 
-To force a specific backend, set `sandbox_backend` to one of the literal values listed above.
+Bubblewrap is not in the Linux auto-detection chain; it is only reachable by naming it explicitly. Landlock and Bubblewrap are compile-time features, and a build that does not enable one skips that backend entirely. Neither feature is in the `default` feature set or in the `dist` set the release build uses, so a stock build starts the Linux list at Firejail and the macOS list at Seatbelt.
+
+After the platform list, `auto` tries Docker only when the runtime kind is neither `native` nor `docker`. Docker is not part of the native runtime's automatic fallback: with `[runtime] kind = "native"` (the default), `auto` never selects Docker even when the daemon is reachable. Docker is also skipped when the runtime is already `docker`, because the runtime container is the boundary. That leaves `[runtime] kind = "cloudflare"` as the only runtime kind where `auto` can reach the Docker backend.
+
+When nothing on the list is available, selection ends at `none` on the native runtime: no OS-level sandbox wraps tool calls, and only the application-layer security described above applies. On the Docker runtime it ends at `docker-runtime` instead, keeping the container boundary with no second sandbox wrapper.
+
+Naming a backend explicitly does not walk this list. If the requested backend is not compiled in, does not work on the platform, is not compatible with the runtime kind, or fails its availability probe, selection goes straight to `none` (native) or `docker-runtime` (Docker runtime), not to the next backend.
+
+To force a specific backend, set `sandbox_backend` to a backend name: `landlock`, `firejail`, `bubblewrap`, `docker`, `sandbox-exec`, or `none`.
 
 ## What the sandbox confines
 
