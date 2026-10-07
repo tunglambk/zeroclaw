@@ -126,7 +126,7 @@ Limitations:
 
 ### Bubblewrap (`bwrap`)
 
-User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Requires `bubblewrap` installed.
+User-namespace-based sandbox from Flatpak. Confines filesystem and runs without network access. Requires `bubblewrap` installed.
 
 <div class="os-tabs-src">
 
@@ -164,7 +164,7 @@ sudo apt install firejail
 
 </div>
 
-Firejail's default profile is fairly permissive; ZeroClaw applies a custom profile. Pass extra args with `firejail_args` on the risk profile.
+Firejail's default profile is fairly permissive, and ZeroClaw skips it with `--noprofile`, passing an explicit flag set instead.
 
 ### Docker
 
@@ -194,7 +194,7 @@ No sandboxing. Tools run with the full privileges of the ZeroClaw service user. 
 
 ## Troubleshooting
 
-- **"Sandbox backend unavailable"** on startup: check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
+- **No sandbox is active**: check `zeroclaw service status` and the journal. Selection logs the backend it settled on ("Landlock sandbox enabled (Linux kernel 5.13+)", "No sandbox backend available, using application-layer security"), and a backend requested explicitly that isn't available warns with its name ("Firejail requested but not available, falling back to application-layer"). The log names the outcome, not every backend it tried.
 - **Tools working on dev, failing in service**: the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
 - **Slow tool invocations** on the Docker runtime: first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 
